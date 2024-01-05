@@ -1,8 +1,7 @@
 # PGNet
-Position-Guided Infrared Small Target Detection
-## Algorithm Introduction
-we propose in this paper a robust infrared small target detection method jointing multiple information and noise prediction, named MINP-Net.
 
+## Algorithm Introduction
+we propose in this paper Position-Guided Infrared Small Target Detection, named PGNet.
 
 ## Prerequisite
 * Tested on Ubuntu 20.04 and 1x NVIDIA 2080Ti 
