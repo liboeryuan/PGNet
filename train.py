@@ -1,137 +1,244 @@
-# torch and visulization
-from tqdm             import tqdm
-import torch.optim    as optim
-from torch.optim      import lr_scheduler
-from torchvision      import transforms
+import os
+import argparse
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+import wandb
 from torch.utils.data import DataLoader
-from DNANet.model.parse_args_train import  parse_args
+from tqdm import tqdm
 
-# metric, loss .etc
-from DNANet.model.utils import *
-from DNANet.model.metric import *
-from DNANet.model.loss import *
-from DNANet.model.load_param_data import  load_dataset, load_param
+# Assuming these are your custom utility files
+from utils.metrics import ROCMetric, mIoU, SamplewiseSigmoidMetric, PD_FA
+from utils.data_ch3 import TrainSetLoader, TestSetLoader
+from utils.util import get_optimizer, make_dir, save_train_parser, copy_files, \
+                       save_best_log, save_best_niou_log, save_train_log
+from utils.loss import SoftIoULoss
 
-# model
-from DNANet.model.model_DNANet import  Res_CBAM_block
-from DNANet.model.model_DNANet import  DNANet
+# Import your model
+from mymodel.PGNet.net import Net
 
-class Trainer(object):
+# Suppress warnings for a cleaner output
+warnings.filterwarnings('ignore')
+
+# For reproducibility, you can uncomment the line below
+# torch.manual_seed(42)
+
+def parse_args():
+    """Parses command-line arguments for training configuration."""
+    parser = argparse.ArgumentParser(description='PyTorch Training Configuration for Infrared Small Target Segmentation')
+
+    # --- Model and Dataset Arguments ---
+    parser.add_argument('--model', type=str, default='PGNet', help='Name of the model to use.')
+    parser.add_argument('--dataset', type=str, default="SIRST", help='Name of the dataset (e.g., SIRST, NUDT-SIRST).')
+    parser.add_argument('--dataset_path', type=str, default="./datasets", help='Root directory of the dataset.')
+    parser.add_argument('--mode', type=str, default="txt", choices=['txt', 'folder'],
+                        help='Dataset loading mode. "txt" uses a split file, "folder" uses directory structure.')
+    parser.add_argument('--split', type=str, default="default",
+                        help='Data split configuration (required for "txt" mode).')
+    parser.add_argument('--in_channels', type=int, default=1, help='Number of input channels for the model.')
+
+    # --- Image Preprocessing Arguments ---
+    parser.add_argument('--base_size', type=int, default=256, help='Base size to which images are resized.')
+    parser.add_argument('--crop_size', type=int, default=256, help='Size of the random crop for training.')
+    parser.add_argument('--resize_gt', type=str, default="no", choices=['yes', 'no'],
+                        help='Whether to resize the ground truth mask during validation.')
+
+    # --- Training and Optimization Arguments ---
+    parser.add_argument('--epochs', type=int, default=300, metavar='N', help='Number of training epochs.')
+    parser.add_argument('--train_batch_size', type=int, default=16, metavar='N', help='Training batch size.')
+    parser.add_argument('--test_batch_size', type=int, default=1, metavar='N', help='Validation batch size.')
+    parser.add_argument('--optimizer', type=str, default='Adagrad', choices=['Adam', 'Adagrad', 'AdamW', 'SGD'],
+                        help='Optimizer for training.')
+    parser.add_argument('--scheduler', type=str, default='CosineAnnealingLR',
+                        choices=['CosineAnnealingLR', 'ReduceLROnPlateau', 'CosineAnnealingWarmRestarts'],
+                        help='Learning rate scheduler.')
+    parser.add_argument('--lr', type=float, default=0.05, metavar='LR', help='Initial learning rate.')
+    parser.add_argument('--min_lr', type=float, default=1e-5, help='Minimum learning rate for schedulers like CosineAnnealingLR.')
+    parser.add_argument('--workers', type=int, default=8, metavar='N', help='Number of data loading threads.')
+
+    # --- Experiment and Logging Arguments ---
+    parser.add_argument('--use_wandb', type=str, default="no", choices=['yes', 'no'],
+                        help='Set to "yes" to use Weights & Biases for logging.')
+    parser.add_argument('--result_dir', type=str, default='./results', help='Directory to save results and checkpoints.')
+
+    return parser.parse_args()
+
+
+class Trainer:
+    """
+    The main class for handling the training and validation pipeline.
+    """
     def __init__(self, args):
-        # Initial
         self.args = args
-        self.ROC  = ROCMetric(1, 10)
-        self.mIoU = mIoU(1)
-        self.save_prefix = '_'.join([args.model, args.dataset])
-        self.save_dir    = args.save_dir
-        nb_filter, num_blocks = load_param(args.channel_size, args.backbone)
 
-        # Read image index from TXT
-        if args.mode == 'TXT':
-            dataset_dir = args.root + '/' + args.dataset
-            train_img_ids, val_img_ids, test_txt = load_dataset(args.root, args.dataset, args.split_method)
+        # --- Initialize Metrics ---
+        self.roc_metric = ROCMetric(1, 10)
+        self.miou_metric = mIoU()
+        self.niou_metric = SamplewiseSigmoidMetric(1, 0)
+        self.pd_fa_metric = PD_FA()
 
-        # Preprocess and load data
-        input_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([.485, .456, .406], [.229, .224, .225])])
-        trainset        = TrainSetLoader(dataset_dir,img_id=train_img_ids,base_size=args.base_size,crop_size=args.crop_size,transform=input_transform,suffix=args.suffix)
-        testset         = TestSetLoader (dataset_dir,img_id=val_img_ids,base_size=args.base_size, crop_size=args.crop_size, transform=input_transform,suffix=args.suffix)
-        self.train_data = DataLoader(dataset=trainset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.workers,drop_last=True)
-        self.test_data  = DataLoader(dataset=testset,  batch_size=args.test_batch_size, num_workers=args.workers,drop_last=False)
+        # --- Setup Datasets and Dataloaders ---
+        train_dataset = TrainSetLoader(args)
+        test_dataset = TestSetLoader(args)
+        print("--------------- Finished loading dataset ---------------")
+        print(f"Number of training samples: {len(train_dataset)}")
+        print(f"Number of validation samples: {len(test_dataset)}")
 
-        # Choose and load model (this paper is finished by one GPU)
-        if args.model   == 'DNANet':
-            model       = DNANet(num_classes=1,input_channels=args.in_channels, block=Res_CBAM_block, num_blocks=num_blocks, nb_filter=nb_filter, deep_supervision=args.deep_supervision)
+        self.train_loader = DataLoader(dataset=train_dataset, batch_size=args.train_batch_size,
+                                       shuffle=True, num_workers=args.workers, drop_last=True)
+        self.val_loader = DataLoader(dataset=test_dataset, batch_size=args.test_batch_size,
+                                     num_workers=args.workers, drop_last=False)
+        print("--------------- Finished loading dataloaders ---------------")
 
-        model           = model.cuda()
-        model.apply(weights_init_xavier)
-        print("Model Initializing")
-        self.model      = model
+        # --- Setup Model, Optimizer, and Loss ---
+        self.model = Net().cuda()
+        self.model = nn.DataParallel(self.model)
+        self.optimizer, self.scheduler = get_optimizer(self.model, self.args)
 
-        # Optimizer and lr scheduling
-        if args.optimizer   == 'Adam':
-            self.optimizer  = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-        elif args.optimizer == 'Adagrad':
-            self.optimizer  = torch.optim.Adagrad(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-        if args.scheduler   == 'CosineAnnealingLR':
-            self.scheduler  = lr_scheduler.CosineAnnealingLR( self.optimizer, T_max=args.epochs, eta_min=args.min_lr)
-        self.scheduler.step()
+        # Define loss functions
+        self.bce_loss = nn.BCELoss()
+        self.soft_iou_loss = SoftIoULoss()
+        
+        # --- Tracking Variables ---
+        self.best_iou = 0
+        self.best_iou_epoch = 0
+        self.best_niou = 0
+        self.best_niou_epoch = 0
+        self.train_loss = 0.0
 
-        # Evaluation metrics
-        self.best_iou       = 0
-        self.best_recall    = [0,0,0,0,0,0,0,0,0,0,0]
-        self.best_precision = [0,0,0,0,0,0,0,0,0,0,0]
-
-    # Training
-    def training(self,epoch):
-
-        tbar = tqdm(self.train_data)
+    def train_one_epoch(self, epoch):
+        """
+        Handles the training loop for a single epoch.
+        """
         self.model.train()
-        losses = AverageMeter()
-        for i, ( data, labels) in enumerate(tbar):
-            data   = data.cuda()
-            labels = labels.cuda()
-            if args.deep_supervision == 'True':
-                preds= self.model(data)
-                loss = 0
-                for pred in preds:
-                    loss += SoftIoULoss(pred, labels)
-                loss /= len(preds)
+        tbar = tqdm(self.train_loader)
+        losses = []
+
+        if self.scheduler is not None:
+            self.scheduler.step(epoch)
+
+        for i, (img, mask, edge) in enumerate(tbar):
+            img, mask = img.cuda(), mask.cuda()
+
+            # Forward pass
+            preds = self.model(img)
+            
+            # Calculate loss
+            # The model may return multiple predictions for deep supervision
+            if isinstance(preds, (list, tuple)):
+                loss = sum(self.soft_iou_loss(pred, mask) for pred in preds)
+                loss += self.bce_loss(preds[-1], mask)  # Main prediction loss
             else:
-               pred = self.model(data)
-               loss = SoftIoULoss(pred, labels)
+                loss = self.soft_iou_loss(preds, mask) + self.bce_loss(preds, mask)
+
+            # Backward pass and optimization
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            losses.update(loss.item(), pred.size(0))
-            tbar.set_description('Epoch %d, training loss %.4f' % (epoch, losses.avg))
-        self.train_loss = losses.avg
+            
+            losses.append(loss.item())
+            current_lr = self.optimizer.param_groups[0]['lr']
+            tbar.set_description(
+                f'Epoch [{epoch:04d}/{self.args.epochs:04d}], '
+                f'Train Loss: {np.mean(losses):.4f}, '
+                f'LR: {current_lr:.8f}'
+            )
+        
+        self.train_loss = np.mean(losses)
 
-    # Testing
-    def testing (self, epoch):
-        tbar = tqdm(self.test_data)
+    def validate(self, epoch):
+        """
+        Handles the validation loop to evaluate the model's performance.
+        """
         self.model.eval()
-        self.mIoU.reset()
-        losses = AverageMeter()
+        self.miou_metric.reset()
+        self.niou_metric.reset()
+        self.roc_metric.reset()
+        self.pd_fa_metric.reset()
+        
+        tbar = tqdm(self.val_loader)
+        val_losses = []
 
         with torch.no_grad():
-            for i, ( data, labels) in enumerate(tbar):
-                data = data.cuda()
-                labels = labels.cuda()
-                if args.deep_supervision == 'True':
-                    preds = self.model(data)
-                    loss = 0
-                    for pred in preds:
-                        loss += SoftIoULoss(pred, labels)
-                    loss /= len(preds)
-                    pred =preds[-1]
-                else:
-                    pred = self.model(data)
-                    loss = SoftIoULoss(pred, labels)
-                losses.update(loss.item(), pred.size(0))
-                self.ROC .update(pred, labels)
-                self.mIoU.update(pred, labels)
-                ture_positive_rate, false_positive_rate, recall, precision = self.ROC.get()
-                _, mean_IOU = self.mIoU.get()
-                tbar.set_description('Epoch %d, test loss %.4f, mean_IoU: %.4f' % (epoch, losses.avg, mean_IOU ))
-            test_loss=losses.avg
-        # save high-performance model
-        save_model(mean_IOU, self.best_iou, self.save_dir, self.save_prefix,
-                   self.train_loss, test_loss, recall, precision, epoch, self.model.state_dict())
+            for i, (img, mask, size, img_name) in enumerate(tbar):
+                img, mask = img.cuda(), mask.cuda()
 
-def main(args):
-    trainer = Trainer(args)
-    for epoch in range(args.start_epoch, args.epochs):
-        trainer.training(epoch)
-        trainer.testing(epoch)
+                # Forward pass
+                preds = self.model(img)
+                
+                # Handle single or multiple predictions
+                main_pred = preds[-1] if isinstance(preds, (list, tuple)) else preds
+                
+                # Crop prediction to original image size
+                # Note: Assumes size is a tuple (height, width)
+                main_pred = main_pred[:, :, :size[0], :size[1]]
+                
+                # Calculate validation loss on the main prediction
+                loss = self.soft_iou_loss(main_pred, mask)
+                val_losses.append(loss.item())
+
+                # Update metrics
+                pred_binary = (main_pred > 0.5).float()
+                self.miou_metric.update(pred_binary, mask)
+                self.niou_metric.update(main_pred, mask)
+                self.roc_metric.update(main_pred, mask)
+                self.pd_fa_metric.update(pred_binary.squeeze(0).squeeze(0).cpu(), mask.squeeze(0).squeeze(0).cpu(), size)
+
+                _, current_iou = self.miou_metric.get()
+                current_niou = self.niou_metric.get()
+                
+                tbar.set_description(
+                    f'Validation - Epoch [{epoch:04d}/{self.args.epochs:04d}], '
+                    f'Val Loss: {np.mean(val_losses):.4f}, '
+                    f'IoU: {current_iou * 100:.2f}%, nIoU: {current_niou * 100:.2f}%'
+                )
+
+        # --- Get final metrics for the epoch ---
+        _, iou = self.miou_metric.get()
+        niou = self.niou_metric.get()
+        pd, fa = self.pd_fa_metric.get()
+        tpr, fpr, recall, precision, _, f1_score = self.roc_metric.get()
+
+            
+        # --- Save best models and logs ---
+        model_state = self.model.module.state_dict()
+        val_loss_mean = np.mean(val_losses)
+
+        if iou > self.best_iou:
+            self.best_iou = iou
+            self.best_iou_epoch = epoch
+            save_best_log(self.args.save_path, epoch, self.train_loss, val_loss_mean, iou, niou,
+                          f1_score, pd, fa, tpr, fpr, recall, precision, model_state)
+            
+        if niou > self.best_niou:
+            self.best_niou = niou
+            self.best_niou_epoch = epoch
+            save_best_niou_log(self.args.save_path, epoch, self.train_loss, val_loss_mean, iou, niou,
+                               f1_score, pd, fa, tpr, fpr, recall, precision, model_state)
+                               
+        save_train_log(self.args.save_path, epoch, self.train_loss, val_loss_mean, iou, niou,
+                       self.best_iou, self.best_iou_epoch, model_state)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     args = parse_args()
-    main(args)
 
+    # Create directory for saving results
+    args.save_path = make_dir(args.result_dir, args.split, args.dataset, args.model)
+    
+    # Save configuration and copy relevant files for reproducibility
+    save_train_parser(args)
+    copy_files(args) # Assuming a function to copy model/util files
 
+    # Initialize W&B if enabled
+    if args.use_wandb == "yes":
+        wandb.init(project=f"{args.model}-{args.dataset}", config=args)
 
+    trainer = Trainer(args=args)
 
-
+    print("============= Training Started =============")
+    for epoch in range(1, args.epochs + 1):
+        trainer.train_one_epoch(epoch)
+        trainer.validate(epoch)
+    print("============= Training Finished =============")
