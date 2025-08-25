@@ -1,4 +1,4 @@
-# The code is coming soon.
+# The complete code will be released after the paper is published.
 
 import torch
 import torch.nn as nn
