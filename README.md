@@ -65,7 +65,7 @@ python train.py
 
 We also provide pretrained model weights, which can be downloaded from the link below:
 
-  * **Pretrained Models**: [Baidu Pan Link](https://www.google.com/search?q=https://pan.baidu.com/s/1vZeVvibTKP5zQawhAgN5FQ) (Password: `dq4b`)
+  * **Pretrained Models**: [Baidu Pan Link](https://pan.baidu.com/s/1vZeVvibTKP5zQawhAgN5FQ) (Password: `dq4b`)
 
 ### 2\. Testing
 
@@ -77,7 +77,7 @@ python test.py
 
 For your convenience, we have also provided the prediction maps for the three datasets:
 
-  * **Prediction Maps**: [Baidu Pan Link](https://www.google.com/search?q=https://pan.baidu.com/s/1jVfyBWyBvKZjgPB390aD4Q) (Password: `iigd`)
+  * **Prediction Maps**: [Baidu Pan Link](https://pan.baidu.com/s/1jVfyBWyBvKZjgPB390aD4Q) (Password: `iigd`)
 
 -----
 
